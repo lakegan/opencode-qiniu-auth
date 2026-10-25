@@ -252,9 +252,18 @@ test("AccessKey 误填成 sk- 时同样直接指出", async () => {
 })
 
 test("usage 配置 AK/SK 后走管理接口，返回百分比窗口", async () => {
+  // 形状按七牛实测响应：计费项名在 key、单位在 unit_name、total 的单位是 unit_size_default 个 token
   const stub = installFetch((url) => {
     if (url.includes("/inapi/v3/stat/new")) {
-      return jsonResponse({ status: true, data: [{ items: [{ name: "输入 tokens", unit: "k/tokens", total: 20000 }] }] })
+      return jsonResponse({
+        status: true,
+        data: [
+          {
+            name: "qiniu/conatus-free",
+            items: [{ key: "output", unit_name: "token", unit_size_default: 1000, total: 20000 }],
+          },
+        ],
+      })
     }
     return jsonResponse({ status: false, error: "unexpected" }, 404)
   })
@@ -281,6 +290,38 @@ test("usage 出错时返回 error 字段而不是抛异常", async () => {
     const usage = await hooks.auth.usage(apiAuth())
     assert.deepEqual(usage.windows, [])
     assert.match(usage.error, /AK\/SK/)
+  } finally {
+    stub.restore()
+  }
+})
+
+// 回归：七牛把计费项名放在 `key`（cache/ncache/output）、单位放在 `unit_name`、
+// 且 total 的单位是 unit_size_default(=1000) 个 token。早前按 name/unit 解析，
+// token 恒为 0 → used 恒为 0 → 界面一直显示「剩余 100%」，看起来像没消耗。
+test("真实响应字段（key/unit_name/unit_size_default）能算出席用量，不是恒 0", async () => {
+  const stub = installFetch(() =>
+    jsonResponse({
+      status: true,
+      data: [
+        {
+          name: "qiniu/conatus-free",
+          items: [
+            { key: "cache", unit_name: "token", unit_size_default: 1000, total: 537.1, values: [] },
+            { key: "ncache", unit_name: "token", unit_size_default: 1000, total: 708.14, values: [] },
+            { key: "output", unit_name: "token", unit_size_default: 1000, total: 15.73, values: [] },
+          ],
+        },
+      ],
+    }),
+  )
+  const hooks = await QiniuPlugin({}, { accessKey: "ak", secretKey: "sk", dailyQuota: 100_000_000 })
+  try {
+    const usage = await hooks.auth.usage(apiAuth())
+    const [window] = usage.windows
+    assert.equal(window.amount, 1_260_970, "1.26M token，不能是 0")
+    assert.ok(window.used > 0, `used 必须动，实际 ${window.used}`)
+    assert.equal(window.used, 1.26097)
+    assert.notEqual(window.display, "剩余 100M / 共 100M（已用 0）")
   } finally {
     stub.restore()
   }

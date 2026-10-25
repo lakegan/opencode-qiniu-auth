@@ -169,7 +169,29 @@ magpie quota
 | 配了 `dailyQuota` | `剩余 75M / 共 100M（已用 25M）` |
 | 没配 | `已用 1.5M（配 dailyQuota 可算剩余）` |
 
-> magpie 的用量窗口只认 `name / used / resetsAt / display / amount / limit / unit / span`，**没有** `remaining` 这类数值字段。所以「剩余」只能由 `display` 这个字符串表达，百分比条走 `used`。真实余额仍以七牛控制台为准。
+> magpie 的用量窗口只认 `name / used / resetsAt / display / amount / limit / unit / span`，**没有** `remaining` 这类数值字段。所以「剩余」只能由 `display` 这个字符串表达，百分比条走 `used`（0–100）。真实余额仍以七牛控制台为准。
+
+### 接口返回的字段名（容易看错）
+
+七牛这个接口的字段命名和直觉不一样，改代码前先对一遍：
+
+```json
+{ "status": true,
+  "data": [ { "name": "qiniu/conatus-free",
+              "items": [ { "key": "cache", "unit_name": "token",
+                           "unit_size_default": 1000, "total": 537.1,
+                           "values": [{ "time": "2026-10-25", "value": 537.1 }] } ] } ] }
+```
+
+| 你以为 | 实际 | 后果 |
+| --- | --- | --- |
+| `item.name` | **`item.key`**（`cache` / `ncache` / `output`）；`name` 在**组**上，是模型 id | 取 `item.name` 永远 `undefined` |
+| `item.unit` | **`item.unit_name`**（`"token"`） | 同上 |
+| `total` 就是 token 数 | `total` 的单位是 **`unit_size_default` 个 token**（当前是 1000） | 漏乘少算三个数量级 |
+
+三项分别是**缓存命中输入**（`cache`）、**未命中输入**（`ncache`）、**输出**（`output`），加起来才是当天消耗。
+
+> 0.3.2 之前只认 `name` / `unit`，导致 token 恒为 0、`used` 恒为 0，界面上就一直显示「剩余 100%」——看起来像一点没用。现已修正并加了回归测试。
 
 **安全**：AK/SK 权限极高（能建删全账号的 Key、读全量日志），只放环境变量或本机配置，别提交到仓库、别贴进对话。插件只拿它读用量，绝不用于模型请求。
 
