@@ -1,7 +1,7 @@
 {
   "name": "opencode-qiniu-auth",
-  "version": "0.3.2",
-  "description": "Magpie / OpenCode provider plugin: 七牛云 MaaS (Modelink) — Conatus Free 与七牛聚合的全部模型",
+  "version": "0.4.0",
+  "description": "Magpie / OpenCode provider plugin: 七牛云 MaaS (Modelink) — 七牛聚合的全部模型，含活动期的免费模型",
   "type": "module",
   "main": "./index.mjs",
   "files": [
@@ -12,8 +12,7 @@
   "scripts": {
     "test": "node --test \"test/*.test.mjs\"",
     "check": "node scripts/check.mjs",
-    "gen:catalog": "node scripts/gen-catalog.mjs",
-    "patch:keys-url": "node scripts/patch-keys-url.mjs"
+    "gen:catalog": "node scripts/gen-catalog.mjs"
   },
   "keywords": [
     "opencode",

@@ -64,11 +64,8 @@ magpie provider test qiniu qiniu/conatus-free
 
 SecretKey 在控制台「密钥管理」页，与 AccessKey 上下相邻，**不是** AI 推理那个页面里的 API Key。
 
-> Key 输入框右侧会出现「Get a key →」按钮，点开直达
-> <https://portal.qiniu.com/ai-inference/api-key>。
-> 该按钮由 Magpie 读 `~/.config/magpie/providers.json` 里 `qiniu` 条目的 `keysUrl` 渲染——
-> 插件的 `auth.methods` 协议没有可点击链接字段，所以安装后需把这个字段补进该配置。
-> `magpie plugin add` 不会自动写入，重装插件后可能需要再补一次。
+创建 API Key 的页面：<https://portal.qiniu.com/ai-inference/api-key>
+（插件把地址放在 provider 元数据的 `keysUrl` 里，由 Magpie 自己决定怎么渲染。插件不写宿主的配置文件。）
 
 > `qiniu` 若已被内置预设占用，Magpie 会把插件供应商改叫 `qiniu-plugin`；`magpie plugin` 的输出里能看到真实 id。
 
@@ -85,6 +82,10 @@ agent 里写 `<供应商>/<模型 key>`。模型 key 去掉了与供应商重复
 | `qwen/qwen3.8-max` | `qiniu/qwen3.8-max` |
 
 请求体里的 `model` 始终是七牛的完整 id（写在模型对象的 `id` 字段），不会因为换了短名而打错。
+
+去前缀只在**全局唯一**时才生效，且结果与列表顺序无关：同一份模型清单无论以什么顺序返回，
+得到的 key 都一样。七牛若日后新增一个撞名的模型，对应的短名会退回完整 id——这是任何去前缀
+方案都无法避免的，要绝对稳定请直接用完整 id（`qiniu/deepseek/deepseek-v4-pro` 也始终可用）。
 
 ## Conatus Free 的额度规则
 
@@ -114,9 +115,9 @@ magpie plugin options qiniu '{"include": ["deepseek", "/^qwen/"], "exclude": ["-
 | `maxConcurrency` | `4` | 每账号并发上限，夹在 1–1000 |
 | `include` / `exclude` | — | 模型过滤，支持字符串前缀或 `/正则/` |
 | `onlyFree` | `false` | 只保留 `-free` 模型，适合「只用免费额度」 |
-| `accessKey` / `secretKey` | — | 可选。**只用于查用量**，不配就看不到任何额度数字；也可用环境变量 `QINIU_ACCESS_KEY` / `QINIU_SECRET_KEY` |
-| `dailyQuota` | `100000000` | 每日 token 档位，用来算「剩余」（认证 1e8，充过 100 元填 1e9） |
-| `plan` / `usageModel` | `Conatus Free` / — | 用量面板上的套餐名、按模型过滤 |
+| `accessKey` / `secretKey` | — | 可选。**只用于查用量**，不配就看不到任何用量数字。不读环境变量：凭证跟着账号走 |
+| `dailyQuota` | — | 可选。**不填就不出百分比**，只报已用量；填了才按 `dailyQuota` 算「剩余」 |
+| `plan` / `usageModel` | `七牛云` / — | 用量面板上的套餐名；填了 `dailyQuota` 时默认只统计 `-free` 模型，可用 `usageModel` 换过滤词 |
 
 模型默认值也能在 `plugins.json` 的供应商 `models` 里逐项覆盖；`provider.models` 会把你写的字段合并进去，不会被线上清单冲掉：
 
@@ -135,9 +136,9 @@ magpie plugin options qiniu '{"include": ["deepseek", "/^qwen/"], "exclude": ["-
 }
 ```
 
-## 额度显示（剩余量从哪来）
+## 用量显示
 
-**为什么默认看不到「剩余」**：七牛只提供**已消耗量**管理接口，没有公开的「免费额度剩余」接口：
+七牛只提供**已消耗量**管理接口，**没有**「剩余额度」接口：
 
 ```
 GET https://api.qiniu.com/ai/inapi/v3/stat/new?start=…&end=…&g=day
@@ -147,15 +148,19 @@ Authorization: Qiniu <AccessKey>:<HMAC-SHA1 urlsafe-base64>
 无凭证访问该接口直接返回 `401 {"error":"bad token","error_code":"BadToken"}`（已实测）。所以：
 
 - **不配 AK/SK** → 一个数字都读不到，账号上会显示原因，而不是空白
-- **配了 AK/SK** → 读到「今日已用」，再按 `dailyQuota` 反推「剩余」
-- **剩余 = dailyQuota − 今日已用**，是配置档位算出来的，不是七牛返回的真实余额
+- **配了 AK/SK** → 读到「今日已用」。**默认只有已用量，没有百分比**
+- **只有你自己填了 `dailyQuota`** → 才出 `used` 百分比与「剩余」估算
+
+`dailyQuota` 没有默认值，也不该有：七牛从未返回过每日上限，内置一个 1e8 会凭空给每个用户
+造出「剩余 100%」，而窗口一旦到 100%，magpie 会把账号挂起——充值用户、用付费模型的用户都会
+被误伤，而且活动 2026-11-30 就结束了。所以插件**绝不自己编额度**。
 
 ```sh
-# 1. 打开七牛控制台 → 密钥管理，拿 AccessKey / SecretKey（与调用用的 sk- API Key 是两套东西）
-export QINIU_ACCESS_KEY=...
-export QINIU_SECRET_KEY=...
+# 1. 登录时会问 AccessKey / SecretKey（控制台 → 密钥管理，与调用用的 sk- API Key 是两套东西）
+#    两项都可以留空，留空就只跑模型、不显示用量
 
-# 2. 告诉插件你的每日档位（认证用户 1e8；充过 100 元是 1e9）
+# 2. 想看到百分比，再告诉插件你的每日档位
+#    活动是「认证用户 1 亿 / 日，充值后最高 10 亿」，只算免费模型，2026-11-30 23:59 结束
 magpie plugin options qiniu '{"dailyQuota": 100000000}'
 
 # 3. 看结果
@@ -164,10 +169,13 @@ magpie quota
 
 窗口里的 `display` 会写成：
 
-| 配置 | 显示 |
-| --- | --- |
-| 配了 `dailyQuota` | `剩余 75M / 共 100M（已用 25M）` |
-| 没配 | `已用 1.5M（配 dailyQuota 可算剩余）` |
+| 配置 | 显示 | 有无百分比 |
+| --- | --- | --- |
+| 没配 `dailyQuota`（默认） | `已用 1.5M（配 dailyQuota 可算剩余）` | 无 `used` / 无 `limit` |
+| 配了 `dailyQuota` | `剩余 75M / 共 100M（已用 25M）` | 有 `used` / 有 `limit` |
+
+> 填了 `dailyQuota` 时，统计**默认只算免费模型**（id 以 `-free` 结尾），因为活动额度只覆盖它们。
+> 想统计全部模型，把 `usageModel` 设成 `""` 以外的词，或直接用默认以外的档位。
 
 > magpie 的用量窗口只认 `name / used / resetsAt / display / amount / limit / unit / span`，**没有** `remaining` 这类数值字段。所以「剩余」只能由 `display` 这个字符串表达，百分比条走 `used`（0–100）。真实余额仍以七牛控制台为准。
 
@@ -193,7 +201,12 @@ magpie quota
 
 > 0.3.2 之前只认 `name` / `unit`，导致 token 恒为 0、`used` 恒为 0，界面上就一直显示「剩余 100%」——看起来像一点没用。现已修正并加了回归测试。
 
-**安全**：AK/SK 权限极高（能建删全账号的 Key、读全量日志），只放环境变量或本机配置，别提交到仓库、别贴进对话。插件只拿它读用量，绝不用于模型请求。
+**安全**：AK/SK 权限极高（能建删全账号的 Key、读全量日志），只放在登录时填的账号 metadata 里，
+别提交到仓库、别贴进对话。插件只拿它读用量，绝不用于模型请求。
+
+> 插件**不读环境变量**，也不写宿主的配置文件。早前的 `QINIU_ACCESS_KEY` / `QINIU_SECRET_KEY`
+> 兜底已移除：一个变量会被套到所有没填 AK/SK 的账号上，查出来就是同一个人的用量；
+> 而且 GUI 启动的 Magpie 读不到 shell 变量。凭证必须跟着账号走。
 
 ## 和 `qiniu/skills` 的分工
 
@@ -207,7 +220,7 @@ npx skills add qiniu/skills --skill maas
 ## 测试
 
 ```sh
-node --test "test/*.test.mjs"   # 39 个用例：签名、用量解析、钩子契约；全部 stub fetch，不花额度
+node --test "test/*.test.mjs"   # 49 个用例：签名、用量解析、钩子契约；全部 stub fetch，不花额度
 node scripts/check.mjs          # 像 Magpie 一样加载插件，检查钩子形状 + 拉一次线上模型清单
 node scripts/gen-catalog.mjs    # 刷新 lib/catalog.mjs 内置快照
 ```
@@ -215,7 +228,7 @@ node scripts/gen-catalog.mjs    # 刷新 lib/catalog.mjs 内置快照
 `check.mjs` 输出示例：
 
 ```
-✓ 插件检查通过（opencode-qiniu-auth@0.1.0）
+✓ 插件检查通过（opencode-qiniu-auth@0.4.0）
   · 内置模型 89 个，免费 4 个
   · 线上模型 89 个
 ```

@@ -15,16 +15,19 @@ import { todayUsageWindow } from "./lib/usage.mjs"
 
 const PROVIDER = "qiniu"
 const DEFAULT_BASE = "https://api.qnaigc.com/v1"
-// 控制台里创建 API Key 的页面：Magpie 会在 Key 输入框右侧渲染「Get a key →」按钮
+// 控制台里创建 API Key 的页面。放在 provider 元数据里交给宿主渲染，
+// 插件不碰宿主的配置文件（早前写 ~/.config/magpie/providers.json 的做法已移除）。
 const KEYS_URL = "https://portal.qiniu.com/ai-inference/api-key"
 // AccessKey / SecretKey 所在的「密钥管理」页（与上面的 API Key 是两套凭证）
 const KEYS_AKSK_PAGE = "https://portal.qiniu.com/developer/user/key"
 const MODELS_TIMEOUT_MS = 10_000
 const CACHE_TTL_MS = 10 * 60 * 1000
 const DEFAULT_CONCURRENCY = 4
-// 活动期免费额度档位：认证用户 1 亿 / 日，充值后 10 亿 / 日。
-// 七牛未公开「剩余额度」接口，因此默认按 1 亿算比例，可用 options.dailyQuota 改。
-const DEFAULT_DAILY_QUOTA = 100_000_000
+// 每日额度没有默认值：七牛不给「剩余额度」接口，任何内置档位都是编的。
+// 只有用户自己填 options.dailyQuota 时才出百分比窗口。
+// 另外活动（认证 1e8 / 充值 1e9）只覆盖免费模型且 2026-11-30 到期，
+// 所以算百分比时只统计免费模型，见 FREE_MODEL_FILTER。
+const FREE_MODEL_FILTER = "-free"
 
 const stripSlash = (value) => String(value ?? "").replace(/\/+$/, "")
 
@@ -75,16 +78,18 @@ async function isKeyRejected(res) {
 
 /**
  * 取 AK/SK，优先级：账号里填的（登录时的 prompts，存在 metadata）
- * → 插件 options → 环境变量。都没配返回 null（那就是不显示额度，不是出错）。
+ * → 插件 options。都没配返回 null（那就是不显示额度，不是出错）。
+ *
+ * 不读环境变量：一个 QINIU_ACCESS_KEY 会被套到所有没填 AK/SK 的账号上，
+ * 查出来就是同一个人的用量；而且 GUI 启动的 magpie 根本读不到 shell 变量。
+ * 凭证必须跟着账号走。
  *
  * 同时做格式体检：七牛有两套完全不同的凭证，填串了接口只会回一个笼统的 401，
  * 排查起来很费劲，所以这里提前说清楚哪一项填错了。
  */
 function readCredentials(options = {}, metadata = {}) {
-  const accessKey =
-    metadata.accessKey || options.accessKey || process.env.QINIU_ACCESS_KEY
-  const secretKey =
-    metadata.secretKey || options.secretKey || process.env.QINIU_SECRET_KEY
+  const accessKey = metadata.accessKey || options.accessKey
+  const secretKey = metadata.secretKey || options.secretKey
   const ak = String(accessKey ?? "").trim()
   const sk = String(secretKey ?? "").trim()
   if (!ak || !sk) return null
@@ -113,8 +118,8 @@ function readCredentials(options = {}, metadata = {}) {
  *   name           供应商显示名（默认「七牛云」）
  *   maxConcurrency 每账号并发上限（默认 4，1–1000）
  *   include / exclude / onlyFree  模型过滤，支持字符串前缀或 /正则/
- *   accessKey / secretKey  可选，仅用于查询今日用量（也可用环境变量注入）
- *   dailyQuota     可选，每日 token 额度，默认 1e8
+ *   accessKey / secretKey  可选，仅用于查询今日用量（不读环境变量，凭证跟账号走）
+ *   dailyQuota     可选，每日 token 额度；**不填就不出百分比**，只报已用量
  *   plan / usageModel      可选，用量显示用的套餐名与模型过滤词
  */
 export const QiniuPlugin = async (input, options) => {
@@ -159,6 +164,8 @@ export const QiniuPlugin = async (input, options) => {
         npm: "@ai-sdk/openai-compatible",
         api: base,
         models: declared,
+        // 只放在 provider 元数据里，由宿主自己决定怎么渲染；
+        // 插件不去写宿主的 providers.json。
         keysUrl: KEYS_URL,
         website: "https://www.qiniu.com/ai/model/qiniu/conatus-free",
       }
@@ -225,6 +232,12 @@ export const QiniuPlugin = async (input, options) => {
       // 七牛不公开「剩余额度」接口，只提供 AK/SK 管理接口查「已消耗量」，
       // 所以必须配 AccessKey/SecretKey 才能读到任何数字；缺了就明说原因，
       // 而不是静默返回空 windows 让界面一片空白。
+      //
+      // 关于「额度」：七牛从来没有返回过每日上限，所以这里**不设默认档位**。
+      // 只有用户自己填了 options.dailyQuota，才给出 limit + used 百分比；
+      // 否则只报已用量。编一个 1e8 出来会让窗口在 100% 时触发 magpie 挂起账号，
+      // 充值用户、用付费模型的用户都会被误伤，而且活动 2026-11-30 就结束了。
+      // 算百分比时还必须只统计免费模型——活动额度只覆盖它们。
       async usage(getAuth) {
         const auth = await getAuth().catch(() => undefined)
         if (auth?.type !== "api" || !auth.key) return { windows: [] }
@@ -240,17 +253,25 @@ export const QiniuPlugin = async (input, options) => {
         if (!creds) {
           return {
             windows: [],
-            error: "未填 AccessKey/SecretKey：七牛只提供「已消耗量」接口，需要 AK/SK 才能算出今日剩余。重新登录并填写这两项即可",
+            error:
+              "未填 AccessKey/SecretKey：七牛只提供「已消耗量」接口，需要 AK/SK 才能读到今日用量。" +
+              "重新登录并填写这两项即可",
           }
         }
 
+        const limit = Number(opts.dailyQuota)
+        const hasLimit = Number.isFinite(limit) && limit > 0
+        // 有上限时只算活动覆盖的免费模型（用户可用 usageModel 覆盖成别的词）；
+        // 没上限时统计全部模型，毕竟「今天用了多少」本身是有意义的
+        const modelFilter = hasLimit ? opts.usageModel ?? FREE_MODEL_FILTER : opts.usageModel
+
         const result = await todayUsageWindow({
           ...creds,
-          dailyLimit: Number(opts.dailyQuota) || DEFAULT_DAILY_QUOTA,
-          modelFilter: opts.usageModel,
+          dailyLimit: hasLimit ? limit : 0,
+          modelFilter,
         })
         if (result.error) return { windows: [], error: clampError(result.error) }
-        return { plan: opts.plan ?? "Conatus Free", ...result }
+        return { plan: opts.plan ?? "七牛云", ...result }
       },
     },
 
@@ -274,7 +295,7 @@ export const _internal = {
   DEFAULT_BASE,
   KEYS_URL,
   KEYS_AKSK_PAGE,
-  DEFAULT_DAILY_QUOTA,
+  FREE_MODEL_FILTER,
   resolveBaseUrl,
   clampConcurrency,
   clampError,

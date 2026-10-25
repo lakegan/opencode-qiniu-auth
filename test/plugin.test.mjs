@@ -180,17 +180,25 @@ test("usage 未配置 AK/SK 时说明原因而不是留空白，且不发请求"
 test("AK/SK 填在登录界面上（存进账号 metadata）就能读用量，不用改配置文件", async () => {
   const stub = installFetch((url) => {
     if (url.includes("/inapi/v3/stat/new")) {
-      return jsonResponse({ status: true, data: [{ items: [{ name: "输入 tokens", unit: "k/tokens", total: 1000 }] }] })
+      return jsonResponse({
+        status: true,
+        data: [
+          {
+            name: "qiniu/conatus-free",
+            items: [{ key: "output", unit_name: "token", unit_size_default: 1000, total: 1000 }],
+          },
+        ],
+      })
     }
     return jsonResponse({ status: false, error: "unexpected" }, 404)
   })
-  // 只给 metadata，options 里什么都没配 —— 模拟「在界面上填了 AK/SK」
-  const hooks = await QiniuPlugin({}, { dailyQuota: 100_000_000 })
+  // options 里什么都没配 —— 模拟「只在界面上填了 AK/SK」
+  const hooks = await QiniuPlugin({}, {})
   try {
     const usage = await hooks.auth.usage(apiAuth("sk-test", { accessKey: "ak-ui", secretKey: "sEcReTkEyUi40cHaRsAbCdEfGhIjKlMnOpQrStUv" }))
     assert.equal(usage.windows.length, 1)
     assert.equal(stub.calls.length, 1)
-    // 签名用的是界面上填的那一对，而不是环境变量或 options
+    // 签名用的是界面上填的那一对
     assert.match(stub.calls[0].init.headers.authorization, /^Qiniu ak-ui:/)
   } finally {
     stub.restore()
@@ -200,7 +208,10 @@ test("AK/SK 填在登录界面上（存进账号 metadata）就能读用量，�
 test("账号 metadata 的 AK/SK 优先于 options 里的", async () => {
   const stub = installFetch((url) => {
     if (url.includes("/inapi/v3/stat/new")) {
-      return jsonResponse({ status: true, data: [{ items: [{ name: "输入 tokens", unit: "tokens", total: 5 }] }] })
+      return jsonResponse({
+        status: true,
+        data: [{ name: "qiniu/conatus-free", items: [{ key: "output", unit_name: "token", unit_size_default: 1000, total: 5 }] }],
+      })
     }
     return jsonResponse({ status: false }, 404)
   })
@@ -208,6 +219,114 @@ test("账号 metadata 的 AK/SK 优先于 options 里的", async () => {
   try {
     await hooks.auth.usage(apiAuth("sk-test", { accessKey: "ak-ui", secretKey: "sEcReTkEyUi40cHaRsAbCdEfGhIjKlMnOpQrStUv" }))
     assert.match(stub.calls[0].init.headers.authorization, /^Qiniu ak-ui:/)
+  } finally {
+    stub.restore()
+  }
+})
+
+// 评审意见：AK/SK 不该退回环境变量。一个 QINIU_ACCESS_KEY 会被套到所有没填
+// AK/SK 的账号上，查出来就是同一个人的用量；GUI 启动的 magpie 也读不到 shell 变量。
+test("不读环境变量：只设了 QINIU_ACCESS_KEY/SECRET_KEY 时不发请求，也不显示用量", async () => {
+  const saved = { ak: process.env.QINIU_ACCESS_KEY, sk: process.env.QINIU_SECRET_KEY }
+  process.env.QINIU_ACCESS_KEY = "env-ak"
+  process.env.QINIU_SECRET_KEY = "env-sk"
+  const stub = installFetch(() => jsonResponse({ status: true, data: [] }))
+  try {
+    const hooks = await QiniuPlugin({}) // options 里没有 AK/SK
+    const usage = await hooks.auth.usage(apiAuth())
+    assert.equal(stub.calls.length, 0, "不能拿环境变量去查别人账号的用量")
+    assert.deepEqual(usage.windows, [])
+    assert.match(usage.error, /AccessKey\/SecretKey/)
+  } finally {
+    stub.restore()
+    if (saved.ak === undefined) delete process.env.QINIU_ACCESS_KEY
+    else process.env.QINIU_ACCESS_KEY = saved.ak
+    if (saved.sk === undefined) delete process.env.QINIU_SECRET_KEY
+    else process.env.QINIU_SECRET_KEY = saved.sk
+  }
+})
+
+// 评审意见：不填 dailyQuota 时给出 1e8 的窗口是编的。窗口到 100% magpie 会挂起账号，
+// 充值用户和用付费模型的用户都会被误伤，而且活动 2026-11-30 结束。
+test("不填 dailyQuota 时只有已用量，没有 limit 也没有 used 百分比", async () => {
+  const stub = installFetch(() =>
+    jsonResponse({
+      status: true,
+      data: [
+        {
+          name: "qiniu/conatus-free",
+          items: [{ key: "output", unit_name: "token", unit_size_default: 1000, total: 2000 }],
+        },
+      ],
+    }),
+  )
+  const hooks = await QiniuPlugin({}, { accessKey: "ak", secretKey: "sk" }) // 没填 dailyQuota
+  try {
+    const usage = await hooks.auth.usage(apiAuth())
+    const [window] = usage.windows
+    assert.equal(window.amount, 2_000_000)
+    assert.equal(window.limit, undefined, "不能凭空造出每日上限")
+    assert.equal(window.used, undefined, "没有上限就不该有百分比，否则 100% 会挂起账号")
+    assert.match(window.display, /^已用 /)
+    assert.equal(window.name, "今日已用")
+  } finally {
+    stub.restore()
+  }
+})
+
+test("填了 dailyQuota 才出百分比，且只统计免费模型（活动额度只覆盖免费模型）", async () => {
+  const stub = installFetch(() =>
+    jsonResponse({
+      status: true,
+      data: [
+        // 免费模型：计入活动额度
+        { name: "qiniu/conatus-free", items: [{ key: "output", unit_name: "token", unit_size_default: 1000, total: 20_000 }] },
+        // 付费模型：不该算进活动额度
+        { name: "deepseek/deepseek-v4-pro", items: [{ key: "output", unit_name: "token", unit_size_default: 1000, total: 80_000 }] },
+      ],
+    }),
+  )
+  const hooks = await QiniuPlugin({}, { accessKey: "ak", secretKey: "sk", dailyQuota: 100_000_000 })
+  try {
+    const usage = await hooks.auth.usage(apiAuth())
+    const [window] = usage.windows
+    assert.equal(window.amount, 20_000_000, "只算 conatus-free 的 2e7，不含付费模型的 8e7")
+    assert.equal(window.limit, 100_000_000)
+    assert.equal(window.used, 20)
+    assert.match(window.display, /剩余 80M/)
+  } finally {
+    stub.restore()
+  }
+})
+
+test("不填 dailyQuota 时统计全部模型（不受免费过滤影响）", async () => {
+  const stub = installFetch(() =>
+    jsonResponse({
+      status: true,
+      data: [
+        { name: "qiniu/conatus-free", items: [{ key: "output", unit_name: "token", unit_size_default: 1000, total: 20_000 }] },
+        { name: "deepseek/deepseek-v4-pro", items: [{ key: "output", unit_name: "token", unit_size_default: 1000, total: 80_000 }] },
+      ],
+    }),
+  )
+  const hooks = await QiniuPlugin({}, { accessKey: "ak", secretKey: "sk" })
+  try {
+    const usage = await hooks.auth.usage(apiAuth())
+    assert.equal(usage.windows[0].amount, 100_000_000, "2e7 + 8e7")
+    assert.equal(usage.windows[0].used, undefined)
+  } finally {
+    stub.restore()
+  }
+})
+
+test("默认套餐名是「七牛云」，不是活动名", async () => {
+  const stub = installFetch(() =>
+    jsonResponse({ status: true, data: [{ name: "qiniu/conatus-free", items: [{ key: "output", unit_name: "token", unit_size_default: 1000, total: 1 }] }] }),
+  )
+  const hooks = await QiniuPlugin({}, { accessKey: "ak", secretKey: "sk" })
+  try {
+    const usage = await hooks.auth.usage(apiAuth())
+    assert.equal(usage.plan, "七牛云")
   } finally {
     stub.restore()
   }
@@ -270,7 +389,7 @@ test("usage 配置 AK/SK 后走管理接口，返回百分比窗口", async () =
   const hooks = await QiniuPlugin({}, { accessKey: "ak", secretKey: "sEcReT40cHaRsAbCdEfGhIjKlMnOpQrStUvWx", dailyQuota: 100_000_000 })
   try {
     const usage = await hooks.auth.usage(apiAuth())
-    assert.equal(usage.plan, "Conatus Free")
+    assert.equal(usage.plan, "七牛云")
     const [window] = usage.windows
     assert.equal(window.amount, 20_000_000)
     assert.equal(window.used, 20)

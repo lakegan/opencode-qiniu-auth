@@ -1,7 +1,7 @@
 import test from "node:test"
 import assert from "node:assert/strict"
 
-import { buildModels, keyFor, prettify, selectModels } from "../lib/models.mjs"
+import { buildModels, keyFor, planKeys, prettify, selectModels } from "../lib/models.mjs"
 
 const ROWS = [
   ["qiniu/conatus-free", 1000000, 128000],
@@ -79,4 +79,61 @@ test("selectModels 支持 onlyFree / include / exclude", () => {
     "kimi-k3-free",
   ])
   assert.deepEqual(Object.keys(selectModels(models, { include: ["/^glm/"] })), ["glm-5.3"])
+})
+
+// 评审意见：qwen3-coder-480b-a35b-instruct、qwen3-235b-a22b-instruct-2507 这类
+// instruct 模型，因为名字里有 qwen3 就被标成推理模型。instruct 必须排除。
+test("instruct 模型不被判为推理模型，即使家族名命中 qwen3 / deepseek-v4", () => {
+  const ids = [
+    "qwen3-235b-a22b-instruct-2507",
+    "qwen3-30b-a3b-instruct-2507",
+    "qwen3-coder-480b-a35b-instruct",
+    "qwen3-next-80b-a3b-instruct",
+    "deepseek/deepseek-v4-instruct",
+  ]
+  const models = buildModels(ids.map((id) => [id, 128000, 8192]))
+  for (const id of ids) {
+    const key = keyFor(id)
+    assert.equal(models[key].reasoning, false, `${id} 不该被判为推理模型`)
+  }
+})
+
+test("真正的推理模型仍然被判为推理模型（instruct 排除不能过头）", () => {
+  const ids = [
+    "qiniu/conatus-free",
+    "deepseek/deepseek-v4-pro",
+    "qwen/qwen3.8-max",
+    "z-ai/glm-5.3",
+    "minimax/minimax-m3",
+  ]
+  const models = buildModels(ids.map((id) => [id, 128000, 8192]))
+  for (const id of ids) {
+    assert.equal(models[keyFor(id)].reasoning, true, `${id} 应被判为推理模型`)
+  }
+})
+
+// 评审意见：key 去前缀时「冲突才退回完整 id」取决于列表顺序，
+// 七牛加一个同名模型，旧 key 就可能变。改成顺序无关。
+test("模型 key 与列表顺序无关", () => {
+  const ids = [["a/x", 1, 1], ["b/y", 1, 1], ["c/x", 1, 1], ["d/z", 1, 1]]
+  const forward = buildModels(ids)
+  const backward = buildModels([...ids].reverse())
+  const shuffled = buildModels([ids[2], ids[0], ids[3], ids[1]])
+  assert.deepEqual(Object.keys(forward).sort(), Object.keys(backward).sort())
+  assert.deepEqual(Object.keys(forward).sort(), Object.keys(shuffled).sort())
+})
+
+test("短名唯一时用短名，撞名时全部退回完整 id（与顺序无关）", () => {
+  // x 出现两次 → 两个都保留完整 id
+  const models = buildModels([["a/x", 1, 1], ["b/x", 1, 1], ["c/only", 1, 1]])
+  assert.deepEqual(Object.keys(models).sort(), ["a/x", "b/x", "only"])
+})
+
+test("planKeys 对同一份 id 集合给出确定结果", () => {
+  const a = planKeys(["z/one", "y/two", "x/one"])
+  const b = planKeys(["x/one", "y/two", "z/one"])
+  assert.equal(a.get("x/one"), "x/one")
+  assert.equal(b.get("x/one"), "x/one")
+  assert.equal(a.get("y/two"), "two")
+  assert.equal(b.get("y/two"), "two")
 })
