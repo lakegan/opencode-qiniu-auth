@@ -1,0 +1,6 @@
+# 发布到 magpie 市场：三层由 magpie-community/plugins 的 dist 分支分发，无需本包出现在 npm
+# 但本包自身若单独发 npm，则只保留运行所需文件
+test/
+scripts/
+.gitignore
+*.test.mjs
