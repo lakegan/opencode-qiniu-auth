@@ -10,7 +10,7 @@
 // 每个导出函数都当作插件调用，所以所有辅助函数都不导出。
 
 import { CATALOG, CATALOG_FETCHED_AT } from "./lib/catalog.mjs"
-import { buildModels, prettify, selectModels } from "./lib/models.mjs"
+import { buildModels, prettify, selectModels, sortModels, sortModelIds } from "./lib/models.mjs"
 import { todayUsageWindow } from "./lib/usage.mjs"
 
 const PROVIDER = "qiniu"
@@ -24,10 +24,39 @@ const MODELS_TIMEOUT_MS = 10_000
 const CACHE_TTL_MS = 10 * 60 * 1000
 const DEFAULT_CONCURRENCY = 4
 // 每日额度没有默认值：七牛不给「剩余额度」接口，任何内置档位都是编的。
-// 只有用户自己填 options.dailyQuota 时才出百分比窗口。
-// 另外活动（认证 1e8 / 充值 1e9）只覆盖免费模型且 2026-11-30 到期，
+// 只有当用户明确声明了档位（activityTier）或填了 dailyQuota 时才出百分比窗口。
+// 活动（实名 1e8 / 充值 1e9）只覆盖免费模型且 2026-11-30 到期，
 // 所以算百分比时只统计免费模型，见 FREE_MODEL_FILTER。
 const FREE_MODEL_FILTER = "-free"
+
+// 活动档位 → 每日 token 额度。
+//
+// 为什么要有这张表：额度靠用户自己填 100000000 太容易错位（多一个零就是十倍），
+// 而插件无法从七牛接口判断账号是实名还是充值 —— /ai/inapi/v3/stat/new 只返回
+// 已消耗量，没有任何套餐/认证状态字段。所以改成让用户声明「我在哪一档」，
+// 由代码负责换算数字。
+//
+// 档位判定（按七牛活动规则）：
+//   verified       实名认证                        → 1 亿 / 天
+//   verified-plus  实名 + 累计充值满 100 元          → 10 亿 / 天
+//
+// 注意「每天」是每日重置，不是活动期一次性总额。若七牛后续改成总额，
+// 需要把窗口从「今日」改成「活动期累计」，届时改 usage.mjs 的 shanghaiDay 调用。
+// 活动期截止 2026-11-30，到期后这两个档位不该再作为额度依据。
+const ACTIVITY_ENDS_AT = "2026-11-30"
+
+const ACTIVITY_TIERS = {
+  // 实名认证用户
+  verified: 1e8,
+  // 实名认证 + 累计充值满 100 元
+  "verified-plus": 1e9,
+}
+
+// 档位说明，用于报错和 README，避免只说数字不说依据
+const TIER_HINTS = {
+  verified: "实名认证 → 1 亿 / 天",
+  "verified-plus": "实名 + 充值满 100 元 → 10 亿 / 天",
+}
 
 const stripSlash = (value) => String(value ?? "").replace(/\/+$/, "")
 
@@ -46,6 +75,67 @@ function clampConcurrency(value) {
 function clampError(message) {
   const text = String(message ?? "").trim() || "未知错误"
   return text.length > 480 ? `${text.slice(0, 477)}…` : text
+}
+
+/**
+ * 解析每日额度上限，优先级：dailyQuota（手填的具体数字）→ activityTier（档位名）。
+ *
+ * 都不填返回 0（只报已用量，不出百分比）。
+ * 档位名不认识时抛错而不是静默返回 0 —— 填错档位的人应该立刻知道，
+ * 而不是看着一个「没有剩余额度」的卡片以为插件没生效。
+ *
+ * @returns {{ limit: number, source: "dailyQuota" | "activityTier" | null }}
+ */
+/**
+ * 活动是否已结束。活动额度有明确截止日（2026-11-30），
+ * 到期后继续按 1e8 / 1e9 算百分比就是编造额度 —— 和当初写死 1e8 那个 bug 同类。
+ */
+function activityExpired(now = Date.now()) {
+  // 按北京时间当天 00:00 判定，与用量窗口的口径一致
+  const end = Date.parse(`${ACTIVITY_ENDS_AT}T23:59:59+08:00`)
+  return Number.isFinite(end) ? now > end : false
+}
+
+/**
+ * 解析每日额度上限，优先级：dailyQuota（手填的具体数字）→ activityTier（档位名）。
+ *
+ * 都不填返回 0（只报已用量，不出百分比）。
+ * 档位名不认识时抛错而不是静默返回 0 —— 填错档位的人应该立刻知道，
+ * 而不是看着一个「没有剩余额度」的卡片以为插件没生效。
+ * 活动期结束后档位失效：不再编造额度，退回只报已用量。
+ *
+ * @returns {{ limit: number, source: "dailyQuota" | "activityTier" | null, expired?: boolean }}
+ */
+function resolveDailyLimit(options = {}, now = Date.now()) {
+  // 手填数字优先：老配置继续可用，也允许用户按真实额度覆盖档位。
+  // 手填值不受活动期影响 —— 用户填的可能是活动之外的额度。
+  const explicit = Number(options.dailyQuota)
+  if (Number.isFinite(explicit) && explicit > 0) {
+    return { limit: explicit, source: "dailyQuota" }
+  }
+
+  const raw = options.activityTier
+  if (raw === undefined || raw === null || String(raw).trim() === "") {
+    return { limit: 0, source: null }
+  }
+
+  const tier = String(raw).trim().toLowerCase()
+  const quota = ACTIVITY_TIERS[tier]
+  if (quota === undefined) {
+    throw new Error(
+      `activityTier 填错了：${raw}。可选值：` +
+        Object.entries(TIER_HINTS)
+          .map(([k, hint]) => `${k}（${hint}）`)
+          .join(" / "),
+    )
+  }
+
+  // 活动已结束：档位不再代表任何真实额度
+  if (activityExpired(now)) {
+    return { limit: 0, source: null, expired: true }
+  }
+
+  return { limit: quota, source: "activityTier" }
 }
 
 /** GET {base}/models → [[id, context_length, max_tokens], …] */
@@ -119,8 +209,11 @@ function readCredentials(options = {}, metadata = {}) {
  *   maxConcurrency 每账号并发上限（默认 4，1–1000）
  *   include / exclude / onlyFree  模型过滤，支持字符串前缀或 /正则/
  *   accessKey / secretKey  可选，仅用于查询今日用量（不读环境变量，凭证跟账号走）
- *   dailyQuota     可选，每日 token 额度；**不填就不出百分比**，只报已用量
+ *   activityTier   可选，活动档位：'verified'（实名，1e8）/ 'verified-plus'（充值，1e9）
+ *   dailyQuota     可选，每日 token 额度；手填值，优先于 activityTier
  *   plan / usageModel      可选，用量显示用的套餐名与模型过滤词
+ *
+ *   activityTier 与 dailyQuota 都不填时不出百分比，只报已用量。
  */
 export const QiniuPlugin = async (input, options) => {
   const opts = options ?? {}
@@ -251,16 +344,23 @@ export const QiniuPlugin = async (input, options) => {
           return { windows: [], error: clampError(error?.message ?? error) }
         }
         if (!creds) {
-          return {
-            windows: [],
-            error:
-              "未填 AccessKey/SecretKey：七牛只提供「已消耗量」接口，需要 AK/SK 才能读到今日用量。" +
-              "重新登录并填写这两项即可",
-          }
+          // AK/SK 是可选字段，缺省不是错误。早前这里返回
+          // error: "未填 AccessKey/SecretKey…"，于是每个跳过这两项的账号
+          // 都在界面上显示「Allowance unavailable: …」，像是坏了。
+          // 没有配额信息就安静地不显示额度，怎么补读 README。
+          return { windows: [] }
         }
 
-        const limit = Number(opts.dailyQuota)
-        const hasLimit = Number.isFinite(limit) && limit > 0
+        // 额度来源：dailyQuota（手填数字）优先，其次 activityTier（档位名）。
+        // 档位名填错会抛错，把原因摆到卡片上，别让用户对着「没有额度」猜。
+        let resolved
+        try {
+          resolved = resolveDailyLimit(opts)
+        } catch (error) {
+          return { windows: [], error: clampError(error?.message ?? error) }
+        }
+        const limit = resolved.limit
+        const hasLimit = limit > 0
         // 有上限时只算活动覆盖的免费模型（用户可用 usageModel 覆盖成别的词）；
         // 没上限时统计全部模型，毕竟「今天用了多少」本身是有意义的
         const modelFilter = hasLimit ? opts.usageModel ?? FREE_MODEL_FILTER : opts.usageModel
@@ -269,6 +369,9 @@ export const QiniuPlugin = async (input, options) => {
           ...creds,
           dailyLimit: hasLimit ? limit : 0,
           modelFilter,
+          // 活动结束但用户仍配着档位：在卡片上说清为什么没有剩余额度，
+          // 否则用户会以为插件坏了。不填 dailyQuota 的话就只能报已用量。
+          expiredTier: resolved.expired ? opts.activityTier : undefined,
         })
         if (result.error) return { windows: [], error: clampError(result.error) }
         return { plan: opts.plan ?? "七牛云", ...result }
@@ -282,8 +385,12 @@ export const QiniuPlugin = async (input, options) => {
         const known = provider?.models ?? declared
         const key = ctx?.auth?.type === "api" ? String(ctx.auth.key ?? "").trim() : ""
         const rows = await liveModelRows(key)
-        if (!rows) return known // 原样返回：Magpie 会保留这份列表
-        return selectModels({ ...known, ...buildModels(rows, known) }, opts)
+        // 拿不到线上列表（未登录 / 断网 / 接口异常）才回退到声明快照。
+        // 这是有意的降级：至少还能选到内置模型，而不是给一个空列表。
+        if (!rows) return sortModels(known)
+        // 线上列表为准：只提供 rows 里真实存在的 id，known 只用于逐模型覆盖。
+        // 早前是 { ...known, ...buildModels(...) }，快照作基底，已下线的模型会永远留着。
+        return selectModels(buildModels(rows, known), opts)
       },
     },
   }
@@ -304,6 +411,13 @@ export const _internal = {
   prettify,
   buildModels,
   selectModels,
+  sortModels,
+  sortModelIds,
+  ACTIVITY_TIERS,
+  ACTIVITY_ENDS_AT,
+  TIER_HINTS,
+  activityExpired,
+  resolveDailyLimit,
   CATALOG,
   CATALOG_FETCHED_AT,
 }

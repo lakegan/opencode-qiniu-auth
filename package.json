@@ -1,6 +1,6 @@
 {
   "name": "opencode-qiniu-auth",
-  "version": "0.4.0",
+  "version": "0.5.0",
   "description": "Magpie / OpenCode provider plugin: 七牛云 MaaS (Modelink) — 七牛聚合的全部模型，含活动期的免费模型",
   "type": "module",
   "main": "./index.mjs",

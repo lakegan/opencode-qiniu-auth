@@ -116,7 +116,8 @@ magpie plugin options qiniu '{"include": ["deepseek", "/^qwen/"], "exclude": ["-
 | `include` / `exclude` | — | 模型过滤，支持字符串前缀或 `/正则/` |
 | `onlyFree` | `false` | 只保留 `-free` 模型，适合「只用免费额度」 |
 | `accessKey` / `secretKey` | — | 可选。**只用于查用量**，不配就看不到任何用量数字。不读环境变量：凭证跟着账号走 |
-| `dailyQuota` | — | 可选。**不填就不出百分比**，只报已用量；填了才按 `dailyQuota` 算「剩余」 |
+| `activityTier` | — | 可选。活动档位：`verified`（实名认证，1 亿/日）或 `verified-plus`（实名且累计充值满 100 元，10 亿/日）。**不填就不出百分比**，只报已用量 |
+| `dailyQuota` | — | 可选。手填每日 token 上限，**优先于 `activityTier`**。活动之外的额度用这个 |
 | `plan` / `usageModel` | `七牛云` / — | 用量面板上的套餐名；填了 `dailyQuota` 时默认只统计 `-free` 模型，可用 `usageModel` 换过滤词 |
 
 模型默认值也能在 `plugins.json` 的供应商 `models` 里逐项覆盖；`provider.models` 会把你写的字段合并进去，不会被线上清单冲掉：
@@ -147,21 +148,30 @@ Authorization: Qiniu <AccessKey>:<HMAC-SHA1 urlsafe-base64>
 
 无凭证访问该接口直接返回 `401 {"error":"bad token","error_code":"BadToken"}`（已实测）。所以：
 
-- **不配 AK/SK** → 一个数字都读不到，账号上会显示原因，而不是空白
+- **不配 AK/SK** → 只报「没有用量信息」，不报错。AK/SK 是可选字段，缺省不是故障
 - **配了 AK/SK** → 读到「今日已用」。**默认只有已用量，没有百分比**
-- **只有你自己填了 `dailyQuota`** → 才出 `used` 百分比与「剩余」估算
+- **只有你声明了 `activityTier` 或填了 `dailyQuota`** → 才出 `used` 百分比与「剩余」估算
 
-`dailyQuota` 没有默认值，也不该有：七牛从未返回过每日上限，内置一个 1e8 会凭空给每个用户
+额度没有默认值，也不该有：七牛从未返回过每日上限，内置一个 1e8 会凭空给每个用户
 造出「剩余 100%」，而窗口一旦到 100%，magpie 会把账号挂起——充值用户、用付费模型的用户都会
 被误伤，而且活动 2026-11-30 就结束了。所以插件**绝不自己编额度**。
+
+插件也无法从接口判断你属于哪一档：`/ai/inapi/v3/stat/new` 只返回已消耗量，没有套餐、
+认证状态或充值记录字段（已实测）。所以改成**你声明档位，插件负责换算数字** ——
+比手填 `100000000` 少一个出错的机会（多一个零就是十倍）。
 
 ```sh
 # 1. 登录时会问 AccessKey / SecretKey（控制台 → 密钥管理，与调用用的 sk- API Key 是两套东西）
 #    两项都可以留空，留空就只跑模型、不显示用量
 
-# 2. 想看到百分比，再告诉插件你的每日档位
-#    活动是「认证用户 1 亿 / 日，充值后最高 10 亿」，只算免费模型，2026-11-30 23:59 结束
-magpie plugin options qiniu '{"dailyQuota": 100000000}'
+# 2. 想看到百分比，声明你属于哪一档
+#    verified      实名认证                         → 1 亿 / 日
+#    verified-plus 实名 + 累计充值满 100 元          → 10 亿 / 日
+#    只算免费模型，活动 2026-11-30 23:59 结束
+magpie plugin options qiniu '{"activityTier": "verified"}'
+
+# 活动之外的额度用手填值（优先级高于档位）
+magpie plugin options qiniu '{"dailyQuota": 50000000}'
 
 # 3. 看结果
 magpie quota
@@ -171,10 +181,12 @@ magpie quota
 
 | 配置 | 显示 | 有无百分比 |
 | --- | --- | --- |
-| 没配 `dailyQuota`（默认） | `已用 1.5M（配 dailyQuota 可算剩余）` | 无 `used` / 无 `limit` |
-| 配了 `dailyQuota` | `剩余 75M / 共 100M（已用 25M）` | 有 `used` / 有 `limit` |
+| 都不配（默认） | `已用 1.5M（配 dailyQuota 可算剩余）` | 无 `used` / 无 `limit` |
+| `activityTier: "verified"` | `剩余 75M / 共 100M（已用 25M）` | 有 `used` / 有 `limit` |
+| `activityTier: "verified-plus"` | `剩余 980M / 共 1B（已用 20M）` | 有 `used` / 有 `limit` |
+| 活动已结束（2026-11-30 之后） | `已用 1.5M（活动档位 verified 已于 2026-11-30 结束，如需显示剩余请填 dailyQuota）` | 无 `used` / 无 `limit` |
 
-> 填了 `dailyQuota` 时，统计**默认只算免费模型**（id 以 `-free` 结尾），因为活动额度只覆盖它们。
+> 有额度时（`activityTier` 或 `dailyQuota`），统计**默认只算免费模型**（id 以 `-free` 结尾），因为活动额度只覆盖它们。
 > 想统计全部模型，把 `usageModel` 设成 `""` 以外的词，或直接用默认以外的档位。
 
 > magpie 的用量窗口只认 `name / used / resetsAt / display / amount / limit / unit / span`，**没有** `remaining` 这类数值字段。所以「剩余」只能由 `display` 这个字符串表达，百分比条走 `used`（0–100）。真实余额仍以七牛控制台为准。
